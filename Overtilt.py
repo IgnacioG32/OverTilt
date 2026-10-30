@@ -1,9 +1,12 @@
 import argparse
+import os
 import re
+import shutil
 import time
 import tkinter as tk
 from collections import deque
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -11,10 +14,50 @@ import pytesseract
 from mss import mss
 
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Rutas habituales del instalador de Tesseract en Windows.
+RUTAS_TESSERACT = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+)
+_tesseract_configurado = False
 
-# Si Tesseract no está en tus variables de entorno globales en Windows, especifica la ruta:
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def localizar_tesseract():
+    """Busca el ejecutable de Tesseract y devuelve su ruta, o None si no existe."""
+    candidatos = [
+        os.environ.get("TESSERACT_CMD"),
+        shutil.which("tesseract"),
+        *RUTAS_TESSERACT,
+    ]
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidatos.append(
+            str(Path(local_appdata) / "Programs" / "Tesseract-OCR" / "tesseract.exe")
+        )
+
+    for candidato in candidatos:
+        if candidato and Path(candidato).is_file():
+            return str(Path(candidato))
+    return None
+
+
+def configurar_tesseract():
+    """Configura pytesseract una sola vez y falla con un mensaje accionable."""
+    global _tesseract_configurado
+    if _tesseract_configurado:
+        return pytesseract.pytesseract.tesseract_cmd
+
+    ruta = localizar_tesseract()
+    if ruta is None:
+        raise RuntimeError(
+            "No se encontró Tesseract OCR. Instálalo desde "
+            "https://github.com/UB-Mannheim/tesseract/wiki o define la variable "
+            "de entorno TESSERACT_CMD con la ruta completa a tesseract.exe."
+        )
+
+    pytesseract.pytesseract.tesseract_cmd = ruta
+    _tesseract_configurado = True
+    return ruta
 
 
 class DetectorResultado:
@@ -144,6 +187,7 @@ def crear_region(monitor):
 
 
 def analizar_frame(frame_bgra):
+    configurar_tesseract()
     frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
@@ -316,6 +360,11 @@ def main():
         help="Analiza una imagen guardada y muestra lo que reconoce Tesseract.",
     )
     args = parser.parse_args()
+
+    try:
+        configurar_tesseract()
+    except RuntimeError as error:
+        parser.exit(1, f"Error: {error}\n")
 
     if args.imagen_prueba:
         probar_imagen(args.imagen_prueba)

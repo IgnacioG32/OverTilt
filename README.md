@@ -97,4 +97,4 @@ Proyecto personal, no oficial ni afiliado a Blizzard. Overwatch es una marca de 
 
 ## Licencia
 
-Todavía no hay una licencia definida para este proyecto.
+Distribuido bajo la licencia MIT. Consulta [LICENSE](LICENSE).

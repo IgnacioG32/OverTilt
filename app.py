@@ -4,25 +4,53 @@ from pathlib import Path
 
 import numpy as np
 from mss import mss
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
+from PySide6.QtCore import (
+    QPoint,
+    QPointF,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtMultimedia import QSoundEffect
-from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QProgressBar,
     QPushButton,
-    QSpinBox,
+    QSizePolicy,
+    QSpacerItem,
     QVBoxLayout,
     QWidget,
 )
 
+import theme
 from Overtilt import ContadorSesion, DetectorResultado, analizar_frame, crear_region
+
+
+def _repolish(widget):
+    """Vuelve a aplicar el QSS después de cambiar una propiedad dinámica."""
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
 
 
 class DetectorThread(QThread):
@@ -83,15 +111,50 @@ class DetectorThread(QThread):
             self.status_changed.emit("Detección detenida")
 
 
+class ResizeGrip(QWidget):
+    """Indicador de agarre dibujado en la esquina inferior derecha."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(143, 163, 157, 120))
+        step = self.width() / 5
+        radius = max(0.9, self.width() / 13)
+        for row in range(3):
+            for column in range(3):
+                if row + column >= 2:
+                    painter.drawEllipse(
+                        QPointF(step * (column + 1.5), step * (row + 1.5)),
+                        radius,
+                        radius,
+                    )
+
+
 class RestDialog(QDialog):
     def __init__(self, streak, parent=None):
         super().__init__(parent)
+        self.setObjectName("restDialog")
         self.setWindowTitle("Pausa recomendada")
         self.setModal(False)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setFixedWidth(390)
+        self.setFixedWidth(420)
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setContentsMargins(28, 26, 28, 24)
+        layout.setSpacing(0)
+
+        badge = QLabel("II")
+        badge.setObjectName("dialogBadge")
+        badge.setFixedSize(44, 44)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addSpacing(16)
+
         title = QLabel("Hora de hacer una pausa")
         title.setObjectName("dialogTitle")
         body = QLabel(
@@ -101,18 +164,37 @@ class RestDialog(QDialog):
         body.setObjectName("dialogBody")
         body.setWordWrap(True)
         button = QPushButton("Entendido")
+        button.setObjectName("primaryButton")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setMinimumHeight(38)
         button.clicked.connect(self.close)
+
         layout.addWidget(title)
         layout.addSpacing(8)
         layout.addWidget(body)
-        layout.addSpacing(16)
+        layout.addSpacing(20)
         layout.addWidget(button)
         QTimer.singleShot(15000, self.close)
 
 
 class OverlayWindow(QWidget):
-    def __init__(self, parent=None):
+    scale_changed = Signal(float)
+    visibility_changed = Signal(bool)
+
+    def __init__(self, settings, parent=None):
         super().__init__(parent)
+        self.settings = settings
+        self.scale = self._load_scale()
+        self._mode = None
+        self._drag_offset = None
+        self._resize_origin = None
+        self._resize_start_size = QSize()
+
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self.save_now)
+
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
@@ -120,75 +202,269 @@ class OverlayWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setObjectName("overlayRoot")
-        self.setFixedSize(390, 116)
-        self._drag_offset = None
+        self.setMouseTracking(True)
 
+        self._metric_slots = []
+        self._build_ui()
+        self._apply_scale(self.scale, emit=False)
+        self._restore_position()
+
+    # -- construcción -----------------------------------------------------
+    def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        panel = QFrame()
-        panel.setObjectName("overlayPanel")
-        row = QHBoxLayout(panel)
-        row.setContentsMargins(16, 12, 12, 12)
-        row.setSpacing(0)
 
-        brand = QVBoxLayout()
-        mark = QLabel("OVERTILT")
-        mark.setObjectName("overlayBrand")
+        self.panel = QFrame()
+        self.panel.setObjectName("overlayPanel")
+        self.row = QHBoxLayout(self.panel)
+        self.row.setSpacing(0)
+
+        self.brand_label = QLabel("OVERTILT")
+        self.brand_label.setObjectName("overlayBrand")
         self.state = QLabel("● DETENIDO")
         self.state.setObjectName("overlayState")
-        brand.addWidget(mark)
-        brand.addWidget(self.state)
-        row.addLayout(brand)
-        row.addSpacing(12)
 
-        self.win_value = self._metric(row, "V", "0", "win")
-        self.loss_value = self._metric(row, "D", "0", "loss")
-        self.streak_value = self._metric(row, "RACHA", "0", "streak")
-        row.addStretch(1)
+        brand = QVBoxLayout()
+        brand.setContentsMargins(0, 0, 0, 0)
+        brand.setSpacing(2)
+        brand.addWidget(self.brand_label, alignment=Qt.AlignmentFlag.AlignLeft)
+        brand.addWidget(self.state, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.row.addLayout(brand)
 
-        hide_button = QPushButton("×")
-        hide_button.setObjectName("overlayHide")
-        hide_button.setFixedSize(25, 25)
-        hide_button.setToolTip("Ocultar overlay")
-        hide_button.clicked.connect(self.hide)
-        row.addWidget(hide_button, alignment=Qt.AlignmentFlag.AlignTop)
-        outer.addWidget(panel)
-        self.setStyleSheet("""
-            QWidget#overlayRoot { background: transparent; }
-            QFrame#overlayPanel { background: rgba(9, 15, 20, 224); border: 1px solid rgba(115, 242, 193, 135); border-radius: 15px; }
-            QLabel#overlayBrand { color: #e8f2f4; font-size: 12px; font-weight: 800; letter-spacing: 1px; }
-            QLabel#overlayState { color: #81929d; font-size: 9px; font-weight: 700; }
-            QLabel#overlayMetricCaption { color: #9aabb3; font-size: 9px; font-weight: 700; }
-            QLabel#overlayMetricValue { font-size: 23px; font-weight: 800; }
-            QWidget[tone="win"] QLabel#overlayMetricValue { color: #73f2c1; }
-            QWidget[tone="loss"] QLabel#overlayMetricValue { color: #ff7d85; }
-            QWidget[tone="streak"] QLabel#overlayMetricValue { color: #f7c96b; }
-            QPushButton#overlayHide { background: rgba(255,255,255,18); color: #b8c4ca; border: none; border-radius: 12px; font-size: 17px; }
-            QPushButton#overlayHide:hover { background: rgba(255,125,133,100); color: white; }
-        """)
+        self.brand_gap = QSpacerItem(
+            12, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum
+        )
+        self.row.addItem(self.brand_gap)
 
-    @staticmethod
-    def _metric(row, caption, value, tone):
+        self.win_value = self._metric("V", "0", "win")
+        self.loss_value = self._metric("D", "0", "loss")
+        self.streak_value = self._metric("RACHA", "0", "streak")
+        self.row.addStretch(1)
+
+        self.hide_button = QPushButton("×")
+        self.hide_button.setObjectName("overlayHide")
+        self.hide_button.setToolTip("Ocultar overlay")
+        self.hide_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hide_button.clicked.connect(self.hide)
+        self.row.addWidget(self.hide_button, alignment=Qt.AlignmentFlag.AlignTop)
+
+        outer.addWidget(self.panel)
+
+        self.grip = ResizeGrip(self)
+        self.grip.setToolTip("Arrastra para cambiar el tamaño")
+
+    def _metric(self, caption, value, tone):
         holder = QWidget()
         holder.setProperty("tone", tone)
         layout = QVBoxLayout(holder)
-        layout.setContentsMargins(9, 0, 9, 0)
-        layout.setSpacing(2)
         cap = QLabel(caption)
         cap.setObjectName("overlayMetricCaption")
         number = QLabel(value)
         number.setObjectName("overlayMetricValue")
         layout.addWidget(cap, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(number, alignment=Qt.AlignmentFlag.AlignHCenter)
-        row.addWidget(holder)
+        self.row.addWidget(holder)
+        self._metric_slots.append(layout)
         return number
+
+    # -- escala y posición ------------------------------------------------
+    def _px(self, value):
+        return max(1, round(value * self.scale))
+
+    def _load_scale(self):
+        try:
+            value = float(self.settings.value("overlay/scale", 1.0))
+        except (TypeError, ValueError):
+            value = 1.0
+        return max(theme.OVERLAY_MIN_SCALE, min(theme.OVERLAY_MAX_SCALE, value))
+
+    def _apply_scale(self, scale, emit=True):
+        self.scale = max(
+            theme.OVERLAY_MIN_SCALE, min(theme.OVERLAY_MAX_SCALE, float(scale))
+        )
+        self.setFixedSize(
+            round(theme.OVERLAY_BASE_WIDTH * self.scale),
+            round(theme.OVERLAY_BASE_HEIGHT * self.scale),
+        )
+
+        self.row.setContentsMargins(
+            self._px(16), self._px(12), self._px(12), self._px(12)
+        )
+        self.brand_gap.changeSize(
+            self._px(12), 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum
+        )
+        for layout in self._metric_slots:
+            layout.setContentsMargins(self._px(9), 0, self._px(9), 0)
+            layout.setSpacing(self._px(2))
+
+        button_size = self._px(25)
+        self.hide_button.setFixedSize(button_size, button_size)
+
+        brand_font = QFont(theme.FONT_FAMILY)
+        brand_font.setPixelSize(max(8, self._px(11)))
+        brand_font.setWeight(QFont.Weight.Bold)
+        brand_font.setLetterSpacing(
+            QFont.SpacingType.AbsoluteSpacing, max(0.4, self.scale * 1.1)
+        )
+        self.brand_label.setFont(brand_font)
+
+        self.setStyleSheet(theme.overlay_stylesheet(self.scale))
+        self._place_grip()
+        if emit:
+            self.scale_changed.emit(self.scale)
+
+    def _place_grip(self):
+        size = self._px(15)
+        self.grip.setFixedSize(size, size)
+        self.grip.move(
+            self.width() - size - self._px(3),
+            self.height() - size - self._px(3),
+        )
+        self.grip.raise_()
+
+    def set_scale(self, scale):
+        self._apply_scale(scale)
+        self._clamp_to_screen()
+        self._schedule_save()
+
+    def _clamp_to_screen(self):
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        margin = 8
+        max_x = max(area.left() + margin, area.right() - self.width() - margin)
+        max_y = max(area.top() + margin, area.bottom() - self.height() - margin)
+        x = max(area.left() + margin, min(self.x(), max_x))
+        y = max(area.top() + margin, min(self.y(), max_y))
+        self.move(x, y)
 
     def place_default(self):
         screen = QGuiApplication.primaryScreen()
-        if screen:
-            area = screen.availableGeometry()
-            self.move(area.right() - self.width() - 24, area.top() + 80)
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        self.move(area.right() - self.width() - 24, area.top() + 80)
+        self._clamp_to_screen()
 
+    def reset_position(self):
+        self.place_default()
+        self._schedule_save()
+
+    def _restore_position(self):
+        position = self.settings.value("overlay/pos")
+        if isinstance(position, QPoint):
+            self.move(position)
+            self._clamp_to_screen()
+        else:
+            self.place_default()
+
+    def _schedule_save(self):
+        self._save_timer.start()
+
+    def save_now(self):
+        self.settings.setValue("overlay/scale", self.scale)
+        self.settings.setValue("overlay/pos", self.pos())
+        self.settings.setValue("overlay/visible", self.isVisible())
+        self.settings.sync()
+
+    # -- arrastre y redimensión -------------------------------------------
+    def _in_grip_zone(self, point):
+        margin = self._px(22)
+        return (
+            point.x() >= self.width() - margin
+            and point.y() >= self.height() - margin
+        )
+
+    def _cursor_for(self, point):
+        if self._in_grip_zone(point):
+            return Qt.CursorShape.SizeFDiagCursor
+        return Qt.CursorShape.ArrowCursor
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+
+        point = event.position().toPoint()
+        if self._in_grip_zone(point):
+            self._mode = "resize"
+            self._resize_origin = event.globalPosition().toPoint()
+            self._resize_start_size = self.size()
+        else:
+            self._mode = "move"
+            self._drag_offset = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+        self.setCursor(self._cursor_for(point))
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        point = event.position().toPoint()
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            if self._mode == "move" and self._drag_offset is not None:
+                self.move(event.globalPosition().toPoint() - self._drag_offset)
+                self._schedule_save()
+                event.accept()
+                return
+            if self._mode == "resize" and self._resize_origin is not None:
+                delta = event.globalPosition().toPoint() - self._resize_origin
+                width = self._resize_start_size.width() + delta.x()
+                height = self._resize_start_size.height() + delta.y()
+                target = max(
+                    width / theme.OVERLAY_BASE_WIDTH,
+                    height / theme.OVERLAY_BASE_HEIGHT,
+                )
+                target = max(
+                    theme.OVERLAY_MIN_SCALE,
+                    min(theme.OVERLAY_MAX_SCALE, target),
+                )
+                if abs(target - self.scale) > 0.001:
+                    self._apply_scale(target)
+                    self._clamp_to_screen()
+                    self._schedule_save()
+                event.accept()
+                return
+
+        self.setCursor(self._cursor_for(point))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._mode is not None:
+            self._mode = None
+            self._drag_offset = None
+            self._resize_origin = None
+            self.setCursor(self._cursor_for(event.position().toPoint()))
+            self._schedule_save()
+        event.accept()
+
+    def leaveEvent(self, event):
+        if self._mode is None:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "grip"):
+            self._place_grip()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        for name, value in theme.OVERLAY_PRESETS:
+            action = menu.addAction(f"{name} · {round(value * 100)} %")
+            action.setCheckable(True)
+            action.setChecked(abs(self.scale - value) < 0.01)
+            action.triggered.connect(
+                lambda checked=False, selected=value: self.set_scale(selected)
+            )
+        menu.addSeparator()
+        reset = menu.addAction("Restablecer posición")
+        reset.triggered.connect(self.reset_position)
+        hide_action = menu.addAction("Ocultar overlay")
+        hide_action.triggered.connect(self.hide)
+        menu.exec(event.globalPos())
+
+    # -- estado ------------------------------------------------------------
     def set_stats(self, wins, losses, streak):
         self.win_value.setText(str(wins))
         self.loss_value.setText(str(losses))
@@ -196,23 +472,76 @@ class OverlayWindow(QWidget):
 
     def set_running(self, running):
         self.state.setText("● CAPTURANDO" if running else "● DETENIDO")
-        self.state.setStyleSheet(
-            f"color: {'#73f2c1' if running else '#81929d'}; font-size: 9px; font-weight: 700"
-        )
+        self.state.setProperty("running", running)
+        _repolish(self.state)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibility_changed.emit(True)
+        self._schedule_save()
 
-    def mouseMoveEvent(self, event):
-        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-            event.accept()
+    def hideEvent(self, event):
+        self.visibility_changed.emit(False)
+        self._schedule_save()
+        super().hideEvent(event)
 
-    def mouseReleaseEvent(self, event):
-        self._drag_offset = None
-        event.accept()
+
+class LimitStepper(QWidget):
+    """Selector numérico compacto con botones − y +."""
+
+    valueChanged = Signal(int)
+
+    def __init__(self, minimum=1, maximum=20, value=3, parent=None):
+        super().__init__(parent)
+        self._minimum = minimum
+        self._maximum = maximum
+        self._value = max(minimum, min(maximum, value))
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.minus = QPushButton("−")
+        self.minus.setObjectName("stepperButton")
+        self.minus.setToolTip("Reducir el límite")
+        self.minus.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.minus.clicked.connect(lambda: self.setValue(self._value - 1))
+
+        self.display = QLabel()
+        self.display.setObjectName("stepperValue")
+        self.display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.display.setToolTip("Usa − y + para ajustar el límite")
+
+        self.plus = QPushButton("+")
+        self.plus.setObjectName("stepperButton")
+        self.plus.setToolTip("Aumentar el límite")
+        self.plus.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plus.clicked.connect(lambda: self.setValue(self._value + 1))
+
+        layout.addWidget(self.minus)
+        layout.addWidget(self.display)
+        layout.addWidget(self.plus)
+        self._refresh()
+
+    def value(self):
+        return self._value
+
+    def setValue(self, value):
+        value = max(self._minimum, min(self._maximum, int(value)))
+        if value == self._value:
+            return
+        self._value = value
+        self._refresh()
+        self.valueChanged.emit(value)
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._refresh()
+
+    def _refresh(self):
+        self.display.setText(f"{self._value} derrotas")
+        self.minus.setEnabled(self.isEnabled() and self._value > self._minimum)
+        self.plus.setEnabled(self.isEnabled() and self._value < self._maximum)
 
 
 class OverTiltWindow(QMainWindow):
@@ -221,14 +550,20 @@ class OverTiltWindow(QMainWindow):
         self.setWindowTitle("OverTilt")
         self.app_icon = QIcon(str(Path(__file__).parent / "assets" / "overtilt.png"))
         self.setWindowIcon(self.app_icon)
-        self.setMinimumSize(760, 620)
-        self.resize(880, 700)
+        self.setMinimumSize(820, 700)
+        self.resize(900, 720)
+
+        self.settings = QSettings()
+        self.theme_name = self.settings.value("appearance/theme", "light")
+        if self.theme_name not in ("light", "dark"):
+            self.theme_name = "light"
         self.detector_thread = None
         self.wins = 0
         self.losses = 0
         self.streak = 0
         self.activity_rows = []
         self.detector_active = False
+
         self.defeat_sound = QSoundEffect(self)
         self.defeat_sound.setSource(
             QUrl.fromLocalFile(str(Path(__file__).parent / "assets" / "defeat.wav"))
@@ -253,20 +588,33 @@ class OverTiltWindow(QMainWindow):
             )
         )
         self.stop_sound.setVolume(0.38)
-        self._build_ui()
-        self._apply_style()
-        # Ventana independiente para que siga visible al minimizar el panel principal.
-        self.overlay = OverlayWindow()
 
+        # Ventana independiente para que siga visible al minimizar el panel principal.
+        self.overlay = OverlayWindow(self.settings)
+
+        self._build_ui()
+        self._restore_preferences()
+        self._apply_theme(self.theme_name, persist=False)
+
+        self.overlay.scale_changed.connect(self._on_overlay_scale_changed)
+        self.overlay.visibility_changed.connect(self._on_overlay_visibility_changed)
+        self._on_overlay_scale_changed(self.overlay.scale)
+        self._on_overlay_visibility_changed(self.overlay.isVisible())
+
+        if self.settings.value("overlay/visible", False, type=bool):
+            QTimer.singleShot(0, self._show_overlay_at_start)
+
+    # -- interfaz ----------------------------------------------------------
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(30, 26, 30, 26)
-        outer.setSpacing(20)
+        outer.setContentsMargins(32, 26, 32, 26)
+        outer.setSpacing(18)
 
         header = QHBoxLayout()
         brand = QHBoxLayout()
+        brand.setSpacing(12)
         logo = QLabel()
         logo.setObjectName("logo")
         logo.setPixmap(
@@ -278,28 +626,79 @@ class OverTiltWindow(QMainWindow):
             )
         )
         brand_text = QVBoxLayout()
+        brand_text.setSpacing(1)
         name = QLabel("OVERTILT")
         name.setObjectName("brand")
-        tagline = QLabel("SESSION COMPANION")
+        brand_font = QFont(theme.FONT_FAMILY)
+        brand_font.setPixelSize(16)
+        brand_font.setWeight(QFont.Weight.Bold)
+        brand_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4)
+        name.setFont(brand_font)
+        tagline = QLabel("COMPAÑERO DE SESIÓN")
         tagline.setObjectName("tagline")
+        tagline_font = QFont(theme.FONT_FAMILY)
+        tagline_font.setPixelSize(9)
+        tagline_font.setWeight(QFont.Weight.DemiBold)
+        tagline_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.6)
+        tagline.setFont(tagline_font)
         brand_text.addWidget(name)
         brand_text.addWidget(tagline)
         brand.addWidget(logo)
         brand.addLayout(brand_text)
         header.addLayout(brand)
         header.addStretch()
-        self.status_dot = QLabel("●")
+
+        theme_switch = QFrame()
+        theme_switch.setObjectName("themeSwitch")
+        theme_layout = QHBoxLayout(theme_switch)
+        theme_layout.setContentsMargins(3, 3, 3, 3)
+        theme_layout.setSpacing(2)
+
+        self.theme_group = QButtonGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_buttons = {}
+
+        for theme_name, label, tooltip in (
+            ("light", "Claro", "Usar el tema claro"),
+            ("dark", "Oscuro", "Usar el tema oscuro"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("themeOption")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setToolTip(tooltip)
+            button.setProperty("themeName", theme_name)
+            self.theme_group.addButton(button)
+            self.theme_buttons[theme_name] = button
+            theme_layout.addWidget(button)
+
+        self.theme_group.buttonClicked.connect(self._on_theme_clicked)
+        header.addWidget(theme_switch, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header.addSpacing(10)
+
+        pill = QFrame()
+        pill.setObjectName("statusPill")
+        pill.setMinimumWidth(220)
+        pill_layout = QHBoxLayout(pill)
+        pill_layout.setContentsMargins(12, 6, 14, 6)
+        pill_layout.setSpacing(7)
+        self.status_dot = QLabel()
         self.status_dot.setObjectName("statusDot")
+        self.status_dot.setFixedSize(8, 8)
         self.status_label = QLabel("Listo para empezar")
         self.status_label.setObjectName("statusLabel")
-        header.addWidget(self.status_dot)
-        header.addWidget(self.status_label)
+        pill_layout.addStretch(1)
+        pill_layout.addWidget(self.status_dot)
+        pill_layout.addWidget(self.status_label)
+        pill_layout.addStretch(1)
+        header.addWidget(pill, alignment=Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(header)
 
         intro = QVBoxLayout()
+        intro.setSpacing(4)
         title = QLabel("Tu sesión, bajo control.")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("Seguimiento de resultados y pausas más saludables.")
+        subtitle = QLabel("Seguimiento sereno de resultados y pausas más saludables.")
         subtitle.setObjectName("subtitle")
         intro.addWidget(title)
         intro.addWidget(subtitle)
@@ -314,88 +713,145 @@ class OverTiltWindow(QMainWindow):
 
         settings = QFrame()
         settings.setObjectName("panel")
-        settings_layout = QHBoxLayout(settings)
-        settings_layout.setContentsMargins(20, 17, 20, 17)
-        settings_info = QVBoxLayout()
-        settings_title = QLabel("Límite de derrotas")
-        settings_title.setObjectName("sectionTitle")
-        settings_hint = QLabel("Te avisaremos cuando alcances esta racha.")
-        settings_hint.setObjectName("muted")
-        settings_info.addWidget(settings_title)
-        settings_info.addWidget(settings_hint)
-        settings_layout.addLayout(settings_info)
-        settings_layout.addStretch()
-        self.loss_limit = QSpinBox()
-        self.loss_limit.setRange(1, 20)
-        self.loss_limit.setValue(3)
-        self.loss_limit.setSuffix(" derrotas")
-        settings_layout.addWidget(self.loss_limit)
-        outer.addWidget(settings)
+        settings_layout = QVBoxLayout(settings)
+        settings_layout.setContentsMargins(22, 17, 22, 17)
+        settings_layout.setSpacing(12)
 
-        progress_panel = QFrame()
-        progress_panel.setObjectName("panel")
-        progress_layout = QVBoxLayout(progress_panel)
-        progress_layout.setContentsMargins(20, 16, 20, 16)
+        limit_row = QHBoxLayout()
+        limit_row.setSpacing(16)
+        limit_info = QVBoxLayout()
+        limit_info.setSpacing(2)
+        limit_title = QLabel("Límite de derrotas")
+        limit_title.setObjectName("sectionTitle")
+        limit_hint = QLabel("Te avisaremos al alcanzar esta racha consecutiva.")
+        limit_hint.setObjectName("hint")
+        limit_info.addWidget(limit_title)
+        limit_info.addWidget(limit_hint)
+        limit_row.addLayout(limit_info)
+        limit_row.addStretch()
+
+        self.loss_limit = LimitStepper(1, 20, 3)
+        self.loss_limit.valueChanged.connect(self._on_loss_limit_changed)
+        limit_row.addWidget(
+            self.loss_limit, alignment=Qt.AlignmentFlag.AlignVCenter
+        )
+        settings_layout.addLayout(limit_row)
+
+        overlay_row = QHBoxLayout()
+        overlay_row.setSpacing(8)
+        overlay_title = QLabel("Tamaño del overlay")
+        overlay_title.setObjectName("fieldLabel")
+        overlay_row.addWidget(overlay_title)
+        overlay_row.addSpacing(6)
+
+        self.overlay_group = QButtonGroup(self)
+        self.overlay_group.setExclusive(True)
+        for preset_name, preset_value in theme.OVERLAY_PRESETS:
+            button = QPushButton(preset_name)
+            button.setObjectName("presetButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.overlay_group.addButton(button, round(preset_value * 100))
+            overlay_row.addWidget(button)
+        self.overlay_group.idClicked.connect(self._set_overlay_scale_from_id)
+
+        self.overlay_scale_label = QLabel("100 %")
+        self.overlay_scale_label.setObjectName("scaleValue")
+        overlay_row.addSpacing(4)
+        overlay_row.addWidget(self.overlay_scale_label)
+        overlay_row.addStretch()
+
+        reset_position = QPushButton("Restablecer posición")
+        reset_position.setObjectName("ghostButton")
+        reset_position.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_position.clicked.connect(self._reset_overlay_position)
+        overlay_row.addWidget(reset_position)
+        settings_layout.addLayout(overlay_row)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        settings_layout.addWidget(divider)
+
         progress_head = QHBoxLayout()
-        progress_head.addWidget(QLabel("Progreso hacia la pausa"))
-        progress_head.addStretch()
+        progress_title = QLabel("Progreso hacia la pausa")
+        progress_title.setObjectName("muted")
         self.progress_text = QLabel("0 / 3")
         self.progress_text.setObjectName("progressText")
+        progress_head.addWidget(progress_title)
+        progress_head.addStretch()
         progress_head.addWidget(self.progress_text)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 3)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
-        progress_layout.addLayout(progress_head)
-        progress_layout.addWidget(self.progress_bar)
-        outer.addWidget(progress_panel)
+        settings_layout.addLayout(progress_head)
+        settings_layout.addWidget(self.progress_bar)
+        outer.addWidget(settings)
 
         lower = QHBoxLayout()
         lower.setSpacing(14)
         activity = QFrame()
         activity.setObjectName("panel")
+        activity.setMinimumHeight(142)
         activity_layout = QVBoxLayout(activity)
-        activity_layout.setContentsMargins(20, 17, 20, 17)
+        activity_layout.setContentsMargins(22, 17, 22, 17)
+        activity_layout.setSpacing(10)
         activity_title = QLabel("Actividad reciente")
         activity_title.setObjectName("sectionTitle")
-        self.activity_label = QLabel("Los resultados detectados aparecerán aquí.")
-        self.activity_label.setObjectName("muted")
-        self.activity_label.setWordWrap(True)
+        self.activity_placeholder = QLabel(
+            "Los resultados detectados aparecerán aquí."
+        )
+        self.activity_placeholder.setObjectName("muted")
+        self.activity_placeholder.setWordWrap(True)
+        self.activity_rows_layout = QVBoxLayout()
+        self.activity_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.activity_rows_layout.setSpacing(8)
         activity_layout.addWidget(activity_title)
-        activity_layout.addSpacing(10)
-        activity_layout.addWidget(self.activity_label)
+        activity_layout.addWidget(self.activity_placeholder)
+        activity_layout.addLayout(self.activity_rows_layout)
         activity_layout.addStretch()
 
         ocr = QFrame()
         ocr.setObjectName("panel")
+        ocr.setMinimumHeight(142)
         ocr_layout = QVBoxLayout(ocr)
-        ocr_layout.setContentsMargins(20, 17, 20, 17)
+        ocr_layout.setContentsMargins(22, 17, 22, 17)
+        ocr_layout.setSpacing(10)
         ocr_title = QLabel("Lectura del OCR")
         ocr_title.setObjectName("sectionTitle")
         self.ocr_label = QLabel("Esperando a iniciar la captura…")
         self.ocr_label.setObjectName("ocrText")
         self.ocr_label.setWordWrap(True)
+        self.ocr_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
         ocr_layout.addWidget(ocr_title)
-        ocr_layout.addSpacing(10)
         ocr_layout.addWidget(self.ocr_label)
         ocr_layout.addStretch()
+
         lower.addWidget(activity, 1)
         lower.addWidget(ocr, 1)
         outer.addLayout(lower, 1)
 
         actions = QHBoxLayout()
+        actions.setSpacing(10)
         self.start_button = QPushButton("Iniciar detección")
         self.start_button.setObjectName("primaryButton")
+        self.start_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_button.clicked.connect(self.start_detection)
         self.stop_button = QPushButton("Detener")
         self.stop_button.setObjectName("secondaryButton")
+        self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_detection)
         self.reset_button = QPushButton("Reiniciar sesión")
         self.reset_button.setObjectName("secondaryButton")
+        self.reset_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_button.clicked.connect(self.reset_session)
         self.overlay_button = QPushButton("Mostrar overlay")
         self.overlay_button.setObjectName("secondaryButton")
+        self.overlay_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.overlay_button.clicked.connect(self.toggle_overlay)
         actions.addWidget(self.start_button)
         actions.addWidget(self.stop_button)
@@ -404,60 +860,116 @@ class OverTiltWindow(QMainWindow):
         actions.addWidget(self.reset_button)
         outer.addLayout(actions)
 
+        self.start_button.setFocus()
+
     def _stat_card(self, row, title, value, tone):
         card = QFrame()
         card.setObjectName("statCard")
-        card.setProperty("tone", tone)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(4)
+        head = QHBoxLayout()
+        head.setSpacing(7)
+        dot = QLabel("●")
+        dot.setObjectName("statDot")
+        dot.setProperty("tone", tone)
         caption = QLabel(title)
         caption.setObjectName("statCaption")
+        head.addWidget(dot)
+        head.addWidget(caption)
+        head.addStretch()
         number = QLabel(value)
         number.setObjectName("statValue")
-        layout.addWidget(caption)
+        layout.addLayout(head)
         layout.addWidget(number)
         row.addWidget(card)
         return number
 
-    def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #0b1015; color: #e9f0f4; font-family: 'Segoe UI'; }
-            QLabel#logo { background: transparent; min-width: 46px; max-width: 46px; min-height: 46px; max-height: 46px; }
-            QLabel#brand { font-size: 16px; font-weight: 800; letter-spacing: 2px; }
-            QLabel#tagline { color: #75838f; font-size: 9px; letter-spacing: 2px; }
-            QLabel#statusDot { color: #73f2c1; font-size: 14px; }
-            QLabel#statusLabel { color: #9aaab4; font-size: 12px; }
-            QLabel#pageTitle { font-size: 28px; font-weight: 700; }
-            QLabel#subtitle, QLabel#muted { color: #82919b; font-size: 12px; }
-            QFrame#statCard, QFrame#panel { background: #121a21; border: 1px solid #202c35; border-radius: 14px; }
-            QLabel#statCaption { color: #84939d; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-            QLabel#statValue { font-size: 32px; font-weight: 700; }
-            QFrame#statCard[tone="win"] QLabel#statValue { color: #73f2c1; }
-            QFrame#statCard[tone="loss"] QLabel#statValue { color: #ff7d85; }
-            QFrame#statCard[tone="streak"] QLabel#statValue { color: #f7c96b; }
-            QLabel#sectionTitle { font-size: 13px; font-weight: 700; }
-            QLabel#progressText { color: #73f2c1; font-size: 12px; font-weight: 700; }
-            QProgressBar { background: #202b33; border: none; border-radius: 5px; height: 9px; }
-            QProgressBar::chunk { background: #73f2c1; border-radius: 5px; }
-            QSpinBox { background: #0d141a; border: 1px solid #2a3944; border-radius: 8px; padding: 8px 10px; min-width: 120px; }
-            QLabel#ocrText { color: #a8b8c2; font-family: Consolas; font-size: 12px; }
-            QPushButton { border-radius: 9px; padding: 11px 18px; font-weight: 700; }
-            QPushButton#primaryButton { background: #73f2c1; color: #08120f; }
-            QPushButton#primaryButton:hover { background: #9bf8d5; }
-            QPushButton#primaryButton:disabled { background: #33443f; color: #81918b; }
-            QPushButton#secondaryButton { background: #172129; border: 1px solid #2b3a44; color: #c4d0d7; }
-            QPushButton#secondaryButton:hover { background: #202d36; }
-            QPushButton#secondaryButton:disabled { color: #59656d; }
-            QLabel#dialogTitle { font-size: 19px; font-weight: 700; color: #73f2c1; }
-            QLabel#dialogBody { color: #b7c3ca; font-size: 13px; }
-        """)
+    # -- preferencias ------------------------------------------------------
+    def _restore_preferences(self):
+        limit = self.settings.value("session/loss_limit", 3, type=int)
+        self.loss_limit.setValue(max(1, min(20, limit)))
+        self._update_progress()
 
+    # -- tema --------------------------------------------------------------
+    def _on_theme_clicked(self, button):
+        self._apply_theme(button.property("themeName"))
+
+    def _apply_theme(self, name, persist=True):
+        if name not in ("light", "dark"):
+            name = "light"
+        self.theme_name = name
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme.main_stylesheet(theme.get_palette(name)))
+
+        # Refrescar estados dinámicos que dependen de propiedades.
+        _repolish(self.status_dot)
+        _repolish(self.ocr_label)
+
+        self._sync_theme_buttons()
+        if persist:
+            self.settings.setValue("appearance/theme", name)
+
+    def _sync_theme_buttons(self):
+        for name, button in self.theme_buttons.items():
+            button.setChecked(name == self.theme_name)
+
+    def _on_loss_limit_changed(self, value):
+        self.settings.setValue("session/loss_limit", value)
+        self._update_progress()
+
+    def _update_progress(self):
+        limit = self.loss_limit.value()
+        self.progress_bar.setMaximum(limit)
+        self.progress_bar.setValue(min(self.streak, limit))
+        self.progress_text.setText(f"{min(self.streak, limit)} / {limit}")
+
+    def _set_overlay_scale_from_id(self, value):
+        self.overlay.set_scale(value / 100)
+        if not self.overlay.isVisible():
+            self.overlay.show()
+            self.overlay.raise_()
+
+    def _on_overlay_scale_changed(self, scale):
+        self.overlay_scale_label.setText(f"{round(scale * 100)} %")
+        match = None
+        for button in self.overlay_group.buttons():
+            preset_value = self.overlay_group.id(button) / 100
+            if abs(preset_value - scale) < 0.01:
+                match = button
+                break
+        if match is not None:
+            match.setChecked(True)
+        else:
+            self.overlay_group.setExclusive(False)
+            for button in self.overlay_group.buttons():
+                button.setChecked(False)
+            self.overlay_group.setExclusive(True)
+
+    def _on_overlay_visibility_changed(self, visible):
+        self.overlay_button.setText(
+            "Ocultar overlay" if visible else "Mostrar overlay"
+        )
+
+    def _reset_overlay_position(self):
+        self.overlay.reset_position()
+        if not self.overlay.isVisible():
+            self.overlay.show()
+            self.overlay.raise_()
+
+    def _show_overlay_at_start(self):
+        self.overlay.show()
+        self.overlay.raise_()
+
+    # -- detección ---------------------------------------------------------
     def start_detection(self):
         if self.detector_thread and self.detector_thread.isRunning():
             return
         self.detector_thread = DetectorThread(self.loss_limit.value())
         self.detector_thread.status_changed.connect(self.set_status)
-        self.detector_thread.ocr_changed.connect(self.ocr_label.setText)
+        self.detector_thread.ocr_changed.connect(self._on_ocr_changed)
         self.detector_thread.stats_changed.connect(self.update_stats)
         self.detector_thread.result_detected.connect(self.add_result)
         self.detector_thread.rest_alert.connect(self.show_rest_alert)
@@ -486,7 +998,8 @@ class OverTiltWindow(QMainWindow):
     def set_status(self, text):
         self.status_label.setText(text)
         active = text.startswith("Capturando") or text.startswith("Conectando")
-        self.status_dot.setStyleSheet(f"color: {'#73f2c1' if active else '#65737d'}")
+        self.status_dot.setProperty("active", active)
+        _repolish(self.status_dot)
         capture_is_active = text.startswith("Capturando")
         if capture_is_active and not self.detector_active:
             self.detector_active = True
@@ -501,23 +1014,56 @@ class OverTiltWindow(QMainWindow):
         self.losses_value.setText(str(losses))
         self.streak_value.setText(str(streak))
         self.overlay.set_stats(wins, losses, streak)
-        limit = self.loss_limit.value()
-        self.progress_bar.setMaximum(limit)
-        self.progress_bar.setValue(min(streak, limit))
-        self.progress_text.setText(f"{min(streak, limit)} / {limit}")
+        self._update_progress()
 
     def add_result(self, result, wins, losses, streak):
         self.update_stats(wins, losses, streak)
         if result == "derrota":
             self.defeat_sound.play()
         label = "Victoria" if result == "victoria" else "Derrota"
-        time_text = time.strftime("%H:%M:%S")
-        tone = "#73f2c1" if result == "victoria" else "#ff7d85"
-        self.activity_rows.insert(0, f'<span style="color:{tone}">● {label}</span> '
-                                  f'<span style="color:#71808a">{time_text}</span>')
-        self.activity_rows = self.activity_rows[:5]
-        self.activity_label.setText("<br>".join(self.activity_rows))
-        self.activity_label.setTextFormat(Qt.TextFormat.RichText)
+        tone = "win" if result == "victoria" else "loss"
+        self._add_activity_row(label, tone, time.strftime("%H:%M:%S"))
+
+    def _add_activity_row(self, label, tone, time_text):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        dot = QLabel("●")
+        dot.setObjectName("activityDot")
+        dot.setProperty("tone", tone)
+        name = QLabel(label)
+        name.setObjectName("activityResult")
+        when = QLabel(time_text)
+        when.setObjectName("activityTime")
+        layout.addWidget(dot)
+        layout.addWidget(name)
+        layout.addStretch()
+        layout.addWidget(when)
+
+        self.activity_rows_layout.insertWidget(0, row)
+        self.activity_rows.insert(0, row)
+        self.activity_placeholder.hide()
+
+        while len(self.activity_rows) > 5:
+            old = self.activity_rows.pop()
+            self.activity_rows_layout.removeWidget(old)
+            old.deleteLater()
+
+    def _clear_activity(self):
+        for row in self.activity_rows:
+            self.activity_rows_layout.removeWidget(row)
+            row.deleteLater()
+        self.activity_rows.clear()
+        self.activity_placeholder.show()
+
+    def _on_ocr_changed(self, text):
+        self._set_ocr_text(text, False)
+
+    def _set_ocr_text(self, text, error):
+        self.ocr_label.setText(text)
+        self.ocr_label.setProperty("error", error)
+        _repolish(self.ocr_label)
 
     def show_rest_alert(self, streak):
         dialog = RestDialog(streak, self)
@@ -527,8 +1073,7 @@ class OverTiltWindow(QMainWindow):
 
     def show_error(self, message):
         self.set_status("Error del detector")
-        self.ocr_label.setText(message)
-        self.ocr_label.setStyleSheet("color: #ff7d85")
+        self._set_ocr_text(message, True)
 
     def reset_session(self):
         if self.detector_thread and self.detector_thread.isRunning():
@@ -536,34 +1081,41 @@ class OverTiltWindow(QMainWindow):
             self.detector_thread.wait(2000)
             self.on_detection_finished()
         self.wins = self.losses = self.streak = 0
-        self.activity_rows.clear()
-        self.activity_label.setText("Los resultados detectados aparecerán aquí.")
+        self._clear_activity()
         self.update_stats(0, 0, 0)
-        self.ocr_label.setStyleSheet("")
-        self.ocr_label.setText("Sesión reiniciada. Lista para empezar.")
+        self._set_ocr_text("Sesión reiniciada. Lista para empezar.", False)
         self.set_status("Listo para empezar")
 
     def toggle_overlay(self):
         if self.overlay.isVisible():
             self.overlay.hide()
-            self.overlay_button.setText("Mostrar overlay")
         else:
-            self.overlay.place_default()
             self.overlay.show()
             self.overlay.raise_()
-            self.overlay_button.setText("Ocultar overlay")
 
     def closeEvent(self, event):
         if self.detector_thread and self.detector_thread.isRunning():
             self.detector_thread.requestInterruption()
             self.detector_thread.wait(2500)
+        self.settings.setValue("session/loss_limit", self.loss_limit.value())
+        self.overlay.save_now()
         event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setOrganizationName("OverTilt")
     app.setApplicationName("OverTilt")
+    app.setStyle("Fusion")
+    app.setFont(QFont(theme.FONT_FAMILY, 10))
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "overtilt.png")))
+
+    settings = QSettings()
+    saved_theme = settings.value("appearance/theme", "light")
+    if saved_theme not in ("light", "dark"):
+        saved_theme = "light"
+    app.setStyleSheet(theme.main_stylesheet(theme.get_palette(saved_theme)))
+
     window = OverTiltWindow()
     window.show()
     sys.exit(app.exec())

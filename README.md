@@ -63,7 +63,7 @@ Opciones útiles:
 python Overtilt.py --limite-derrotas 5            # aviso tras 5 derrotas seguidas
 python Overtilt.py --sin-vista-previa             # solo consola, sin ventanas de OpenCV
 python Overtilt.py --depurar-ocr                  # imprime lo que lee Tesseract
-python Overtilt.py --imagen-prueba image_victoria.png
+python Overtilt.py --imagen-prueba tests/fixtures/image_victoria.png
 ```
 
 ## Calibración
@@ -82,6 +82,7 @@ Overtilt.py     # Núcleo de detección y CLI (tkinter/OpenCV)
 detector.py     # Herramienta de calibración de la región
 tools/          # Utilidades (generación de sonidos)
 assets/         # Icono y efectos de sonido
+tests/fixtures/ # Capturas de ejemplo para --imagen-prueba
 ```
 
 ## Limitaciones conocidas

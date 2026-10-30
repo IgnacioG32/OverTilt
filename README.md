@@ -13,7 +13,9 @@
 - Detecta los banners de **VICTORIA** y **DERROTA** con captura de pantalla + OCR (Tesseract).
 - Cuenta victorias, derrotas y racha actual de derrotas.
 - Muestra un aviso y un sonido al alcanzar el límite de derrotas consecutivas que elijas.
-- Overlay flotante siempre visible con las estadísticas de la sesión.
+- Overlay flotante siempre visible, redimensionable y con las estadísticas de la sesión.
+- Interfaz clara y serena, con ajustes que se conservan entre sesiones.
+- Tema claro y oscuro con un clic, recordado entre sesiones.
 - Vista del texto que lee el OCR para depurar la detección.
 - Interfaz de escritorio (PySide6) y modo CLI con vista previa.
 
@@ -66,6 +68,23 @@ python Overtilt.py --depurar-ocr                  # imprime lo que lee Tesseract
 python Overtilt.py --imagen-prueba tests/fixtures/image_victoria.png
 ```
 
+## Overlay
+
+El overlay se puede mover y redimensionar sin salir del juego:
+
+- Arrastra el panel para moverlo.
+- Arrastra la esquina inferior derecha para escalarlo proporcionalmente.
+- Usa los presets **Compacto / Normal / Grande / Extra** en la ventana principal o en el menú contextual del overlay (clic derecho).
+- Desde ese menú también puedes restablecer la posición u ocultarlo.
+
+La escala, la posición y el límite de derrotas se guardan automáticamente y se restauran la próxima vez que abras la aplicación. Si el overlay queda fuera de pantalla, se reajusta al área visible del monitor.
+
+## Tema
+
+El selector **Claro / Oscuro** de la cabecera cambia el aspecto de la ventana principal y del diálogo de pausa. El overlay flotante se mantiene oscuro y translúcido en ambos temas para integrarse mejor con el juego.
+
+La elección se recuerda entre sesiones.
+
 ## Calibración
 
 La región de captura está calibrada para 1920×1080 (`left=669`, `top=431`, ancho `621`, alto `214`) y se escala según el tamaño del monitor. Si tu HUD o resolución hacen que no se detecte nada:
@@ -78,6 +97,7 @@ La región de captura está calibrada para 1920×1080 (`left=669`, `top=431`, an
 
 ```text
 app.py          # Aplicación de escritorio (PySide6)
+theme.py        # Paleta, tipografía y hojas de estilo
 Overtilt.py     # Núcleo de detección y CLI (tkinter/OpenCV)
 detector.py     # Herramienta de calibración de la región
 tools/          # Utilidades (generación de sonidos)
